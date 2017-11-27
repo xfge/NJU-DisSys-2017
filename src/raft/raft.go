@@ -37,7 +37,7 @@ const (
 const HeartBeatInterval = 50 * time.Millisecond
 
 // DebugMode for true shows logs
-const DebugMode = true
+const DebugMode = false
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -70,7 +70,6 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	// channel
 	state         int
 	voteCount     int
 	chanCommit    chan bool
@@ -192,7 +191,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.persist()
 	reply.VoteGranted = false
 
-	// If a server receives a request with a stale term number, it rejects the request.
+	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		if DebugMode {
@@ -210,14 +209,14 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 
-	uptoDate := false
-	// at least up to date
+	// Determine if the log is at least up to date
+	isUpToDate := false
 	if args.LastLogTerm > rf.getLastLogTerm() || args.LastLogTerm == rf.getLastLogTerm() && args.LastLogIndex >= rf.getLastLogIndex() {
-		uptoDate = true
+		isUpToDate = true
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && uptoDate {
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && isUpToDate {
 		rf.chanGrantVote <- true
 		rf.state = StateFollower
 		reply.VoteGranted = true
@@ -297,12 +296,13 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
 	// todo: implement in lab3
 
 	return ok
 }
 
-func (rf *Raft) boatcastRequestVote() {
+func (rf *Raft) broadcastRequestVote() {
 	var args RequestVoteArgs
 	rf.mu.Lock()
 	args.Term = rf.currentTerm
@@ -315,14 +315,14 @@ func (rf *Raft) boatcastRequestVote() {
 		if i != rf.me && rf.state == StateCandidate {
 			go func(i int) {
 				var reply RequestVoteReply
-				// fmt.Printf("%v RequestVote to %v\n", rf.me, i)
+				// handle in sendRequestVote
 				rf.sendRequestVote(i, args, &reply)
 			}(i)
 		}
 	}
 }
 
-func (rf *Raft) boatcastAppendEntries() {
+func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -413,13 +413,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for {
 			switch rf.state {
 			case StateLeader:
-				rf.boatcastAppendEntries()
+				rf.broadcastAppendEntries()
 				time.Sleep(HeartBeatInterval)
 			case StateFollower:
 				select {
 				case <-rf.chanHeartbeat:
 				case <-rf.chanGrantVote:
-				case <-time.After(time.Duration(rand.Int63()%233+500) * time.Millisecond):
+				case <-time.After(time.Duration(rand.Int63()%233+100) * time.Millisecond):
 					rf.state = StateCandidate
 				}
 			case StateCandidate:
@@ -429,14 +429,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.voteCount = 1
 				rf.persist()
 				rf.mu.Unlock()
-				go rf.boatcastRequestVote()
+				go rf.broadcastRequestVote()
 
 				if DebugMode {
 					fmt.Printf("Node %v ==> CANDIDATE for term %v\n", rf.me, rf.currentTerm)
 				}
 
 				select {
-				case <-time.After(time.Duration(rand.Int63()%233+550) * time.Millisecond):
+				case <-time.After(time.Duration(rand.Int63()%233+100) * time.Millisecond):
 				case <-rf.chanHeartbeat:
 					rf.state = StateFollower
 					if DebugMode {
@@ -446,14 +446,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.mu.Lock()
 					rf.state = StateLeader
 					if DebugMode {
-						fmt.Printf("Node %v ==> LEADER\n", rf.me)
+						fmt.Printf("CANDIDATE Node %v ==> LEADER\n", rf.me)
 					}
-					rf.nextIndex = make([]int, len(rf.peers))
-					rf.matchIndex = make([]int, len(rf.peers))
-					for i := range rf.peers {
-						rf.nextIndex[i] = rf.getLastLogIndex() + 1
-						rf.matchIndex[i] = 0
-					}
+					// todo: implement index operation of peers
 					rf.mu.Unlock()
 				}
 			}
