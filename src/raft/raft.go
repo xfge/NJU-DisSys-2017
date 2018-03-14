@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	StateLeader = iota
+	StateLeader    = iota
 	StateCandidate
 	StateFollower
 )
@@ -95,8 +95,7 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	var term = rf.currentTerm
-	var isleader = rf.state == StateLeader
-	return term, isleader
+	return term, rf.state == StateLeader
 }
 
 func (rf *Raft) getLastLogIndex() int {
@@ -171,14 +170,23 @@ type RequestVoteReply struct {
 // AppendEntriesArgs AppendEntries RPC arguments structure.
 //
 type AppendEntriesArgs struct {
-	// todo: add payloads in lab3
+	// Your data here.
+	Term         int
+	LeaderId     int
+	PrevLogTerm  int
+	PrevLogIndex int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 //
 // AppendEntriesReply AppendEntries RPC reply structure.
 //
 type AppendEntriesReply struct {
-	// todo: add payloads in lab3
+	// Your data here.
+	Term      int
+	Success   bool
+	NextIndex int
 }
 
 //
@@ -228,8 +236,81 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if DebugMode {
-		fmt.Printf("Node %v (currentTerm: %v) rejects:%v args.term:%v\n", rf.me, rf.currentTerm, args.CandidateID, args.Term)
+		fmt.Printf("Node %v (currentTerm: %v) rejects:%v term:%v\n", rf.me, rf.currentTerm, args.CandidateID, args.Term)
 	}
+}
+
+//
+// AppendEntries RPC handler.
+//
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Your code here.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+
+	reply.Success = false
+
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.NextIndex = rf.getLastLogIndex() + 1
+		if DebugMode {
+			fmt.Printf("Node %v (currentTerm: %v) rejects:%v term:%v\n", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+		}
+		return
+	}
+
+	rf.chanHeartbeat <- true
+
+	if DebugMode {
+		fmt.Printf("Node %v receives message from LeaderId:%v\n", rf.me, args.LeaderId)
+	}
+
+	// If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state.
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = StateFollower
+		rf.votedFor = -1
+	}
+	reply.Term = args.Term
+
+	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		reply.NextIndex = rf.getLastLogIndex() + 1
+		return
+	}
+
+	// AssertTrue(args.Term == rf.currentTerm && args.PrevLogIndex <= rf.getLastLogIndex())
+	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+	logTerm := rf.log[args.PrevLogIndex].LogTerm
+	if args.PrevLogTerm != logTerm {
+		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			if rf.log[i].LogTerm != logTerm {
+				reply.NextIndex = i + 1
+				break
+			}
+		}
+		return
+	}
+
+	// 4. Append any new entries not already in the log
+	rf.log = rf.log[: args.PrevLogIndex+1]
+	rf.log = append(rf.log, args.Entries...)
+
+	reply.Success = true
+	reply.NextIndex = rf.getLastLogIndex() + 1
+
+	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit > rf.getLastLogIndex() {
+			rf.commitIndex = rf.getLastLogIndex()
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+		rf.chanCommit <- true
+	}
+	return
 }
 
 //
@@ -279,26 +360,43 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
-//
-// AppendEntries RPC handler.
-//
-func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	defer rf.persist()
-
-	rf.chanHeartbeat <- true
-
-	// todo: implement in lab3
-
-	return
-}
-
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok {
+		if rf.state != StateLeader {
+			return ok
+		}
+		if args.Term != rf.currentTerm {
+			return ok
+		}
 
-	// todo: implement in lab3
-
+		// If a leader discovers that its term is out of date, it immediately reverts to follower state.
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = StateFollower
+			rf.votedFor = -1
+			rf.persist()
+			if DebugMode {
+				fmt.Printf("Node %v reverts to Follower State", rf.me)
+			}
+			return ok
+		}
+		if reply.Success {
+			// not heart beat
+			if len(args.Entries) > 0 {
+				//fmt.Printf("Node %v reply true to leader %v: nextIndex:%v, appended log len:%v\n", server, rf.me, rf.nextIndex[server], len(args.Entries))
+				//rf.nextIndex[server] += len(args.Entries)
+				rf.nextIndex[server] = reply.NextIndex
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			}
+		} else {
+			//fmt.Printf("Node %v reply false to leader %v: nextIndex:%v len:%v\n", server, rf.me, reply.NextIndex, len(args.Entries))
+			//rf.nextIndex[server] -= 1
+			rf.nextIndex[server] = reply.NextIndex
+		}
+	}
 	return ok
 }
 
@@ -315,7 +413,6 @@ func (rf *Raft) broadcastRequestVote() {
 		if i != rf.me && rf.state == StateCandidate {
 			go func(i int) {
 				var reply RequestVoteReply
-				// handle in sendRequestVote
 				rf.sendRequestVote(i, args, &reply)
 			}(i)
 		}
@@ -325,16 +422,39 @@ func (rf *Raft) broadcastRequestVote() {
 func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	currentCommitIndex := rf.commitIndex
+	lastLogIndex := rf.getLastLogIndex()
+	for i := rf.commitIndex + 1; i <= lastLogIndex; i++ {
+		cnt := 1
+		for j := range rf.peers {
+			if rf.me != j && rf.matchIndex[j] >= i && rf.log[i].LogTerm == rf.currentTerm {
+				cnt++
+			}
+		}
+		if 2*cnt > len(rf.peers) {
+			currentCommitIndex = i
+		}
+	}
+	if currentCommitIndex != rf.commitIndex {
+		rf.commitIndex = currentCommitIndex
+		rf.chanCommit <- true
+	}
 
 	for i := range rf.peers {
-		if i != rf.me && rf.state == StateLeader {
+		if rf.me != i && rf.state == StateLeader {
 			var args AppendEntriesArgs
-			// todo: add payloads
-
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+			args.PrevLogIndex = rf.nextIndex[i] - 1
+			if args.PrevLogIndex >= len(rf.log) {
+				fmt.Printf("Node %v: Something goes wrong. prevlogindex:%v, len(log):%v\n", rf.me, args.PrevLogIndex, len(rf.log))
+			}
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].LogTerm
+			args.Entries = make([]LogEntry, len(rf.log[args.PrevLogIndex+1:]))
+			copy(args.Entries, rf.log[args.PrevLogIndex+1:])
+			args.LeaderCommit = rf.commitIndex
 			go func(i int, args AppendEntriesArgs) {
 				var reply AppendEntriesReply
-				// todo: implement in the future
-
 				rf.sendAppendEntries(i, args, &reply)
 			}(i, args)
 		}
@@ -401,10 +521,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.log = append(rf.log, LogEntry{LogTerm: 0})
 	rf.currentTerm = 0
-	rf.chanCommit = make(chan bool)
-	rf.chanHeartbeat = make(chan bool)
-	rf.chanGrantVote = make(chan bool)
-	rf.chanLeader = make(chan bool)
+	rf.chanCommit = make(chan bool, 100)
+	rf.chanHeartbeat = make(chan bool, 100)
+	rf.chanGrantVote = make(chan bool, 100)
+	rf.chanLeader = make(chan bool, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -448,9 +568,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					if DebugMode {
 						fmt.Printf("CANDIDATE Node %v ==> LEADER\n", rf.me)
 					}
-					// todo: implement index operation of peers
+					rf.nextIndex = make([]int, len(rf.peers))
+					rf.matchIndex = make([]int, len(rf.peers))
+					for i := range rf.peers {
+						rf.nextIndex[i] = rf.getLastLogIndex() + 1
+						rf.matchIndex[i] = 0
+					}
 					rf.mu.Unlock()
 				}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-rf.chanCommit:
+				rf.mu.Lock()
+				commitIndex := rf.commitIndex
+				for i := rf.lastApplied + 1; i <= commitIndex; i++ {
+					msg := ApplyMsg{Index: i, Command: rf.log[i].LogComd}
+					applyCh <- msg
+					rf.lastApplied = i
+				}
+				rf.mu.Unlock()
 			}
 		}
 	}()
